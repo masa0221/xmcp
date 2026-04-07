@@ -314,13 +314,28 @@ def build_oauth1_client() -> OAuth1Client:
         raise RuntimeError(
             "Missing X_OAUTH_CONSUMER_KEY or X_OAUTH_CONSUMER_SECRET for OAuth1 signing."
         )
-    access_token = os.getenv("X_OAUTH_ACCESS_TOKEN", "").strip()
-    access_secret = os.getenv("X_OAUTH_ACCESS_TOKEN_SECRET", "").strip()
+    access_token = os.getenv("X_OAUTH1_ACCESS_TOKEN", "").strip()
+    access_secret = os.getenv("X_OAUTH1_ACCESS_TOKEN_SECRET", "").strip()
 
     if access_token and access_secret:
         OAUTH_LOGGER.info(
             "Using existing OAuth1 tokens from environment, skipping browser flow."
         )
+    elif access_token or access_secret:
+        missing = (
+            "X_OAUTH1_ACCESS_TOKEN_SECRET"
+            if access_token
+            else "X_OAUTH1_ACCESS_TOKEN"
+        )
+        OAUTH_LOGGER.warning(
+            "%s is set but %s is missing; falling back to browser OAuth1 flow.",
+            "X_OAUTH1_ACCESS_TOKEN" if access_token else "X_OAUTH1_ACCESS_TOKEN_SECRET",
+            missing,
+        )
+        access_token, access_secret = run_oauth1_flow()
+        if is_truthy(os.getenv("X_OAUTH_PRINT_TOKENS", "0")):
+            print("OAuth1 access token:", access_token)
+            print("OAuth1 access token secret:", access_secret)
     else:
         access_token, access_secret = run_oauth1_flow()
         if is_truthy(os.getenv("X_OAUTH_PRINT_TOKENS", "0")):
@@ -469,6 +484,10 @@ def main() -> None:
     host = os.getenv("MCP_HOST", "127.0.0.1")
     port = int(os.getenv("MCP_PORT", "8000"))
     transport = os.getenv("MCP_TRANSPORT", "http")
+    if transport not in ("http", "sse", "stdio"):
+        raise RuntimeError(
+            f"Unsupported MCP_TRANSPORT={transport!r}. Use 'http', 'sse', or 'stdio'."
+        )
     mcp = create_mcp()
     mcp.run(transport=transport, host=host, port=port)
 

@@ -103,14 +103,14 @@ process. Set `X_OAUTH_PRINT_TOKENS=1` to print tokens, or
 ### Reusing OAuth1 tokens (headless / Docker)
 
 To skip the browser flow on subsequent startups, set both
-`X_OAUTH_ACCESS_TOKEN` and `X_OAUTH_ACCESS_TOKEN_SECRET` in your `.env`.
+`X_OAUTH1_ACCESS_TOKEN` and `X_OAUTH1_ACCESS_TOKEN_SECRET` in your `.env`.
 When both are present the server uses them directly and never opens a browser.
 
 1. Run once with `X_OAUTH_PRINT_TOKENS=1`, complete the browser flow.
 2. Copy the printed tokens into `.env`:
    ```
-   X_OAUTH_ACCESS_TOKEN=<token>
-   X_OAUTH_ACCESS_TOKEN_SECRET=<secret>
+   X_OAUTH1_ACCESS_TOKEN=<token>
+   X_OAUTH1_ACCESS_TOKEN_SECRET=<secret>
    ```
 3. Restart the server — no browser needed.
 
