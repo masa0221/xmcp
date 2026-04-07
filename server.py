@@ -1,20 +1,14 @@
+import asyncio
 import copy
-import http.server
 import json
 import logging
 import os
-import socketserver
-import threading
 import time
-import urllib.parse
-import webbrowser
-from pathlib import Path
 
 import httpx
 import requests
-from oauthlib.oauth1 import Client as OAuth1Client
-from requests_oauthlib import OAuth1Session
 from fastmcp import FastMCP
+from pathlib import Path
 
 HTTP_METHODS = {
     "get",
@@ -28,11 +22,9 @@ HTTP_METHODS = {
 }
 
 LOGGER = logging.getLogger("xmcp.x_api")
-OAUTH_LOGGER = logging.getLogger("xmcp.oauth1")
+AUTH_LOGGER = logging.getLogger("xmcp.oauth2")
 
-REQUEST_TOKEN_URL = "https://api.x.com/oauth/request_token"
-AUTHORIZE_URL = "https://api.x.com/oauth/authorize"
-ACCESS_TOKEN_URL = "https://api.x.com/oauth/access_token"
+OAUTH2_TOKEN_URL = "https://api.x.com/2/oauth2/token"
 
 
 def is_truthy(value: str | None) -> bool:
@@ -89,118 +81,6 @@ def load_openapi_spec() -> dict:
     response = requests.get(url, timeout=30)
     response.raise_for_status()
     return response.json()
-
-
-def _get_env_int(key: str, default: int) -> int:
-    raw = os.getenv(key, "").strip()
-    if not raw:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        raise RuntimeError(f"{key} must be an integer value.")
-
-
-def _callback_url(host: str, port: int, path: str) -> str:
-    return f"http://{host}:{port}{path}"
-
-
-def _wait_for_callback(
-    host: str, port: int, path: str, timeout_seconds: int
-) -> tuple[str, str]:
-    params: dict[str, str | None] = {"oauth_token": None, "oauth_verifier": None}
-    event = threading.Event()
-
-    class _Handler(http.server.BaseHTTPRequestHandler):
-        def do_GET(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
-            parsed = urllib.parse.urlparse(self.path)
-            if parsed.path != path:
-                self.send_response(404)
-                self.end_headers()
-                self.wfile.write(b"Not found.")
-                return
-            query = urllib.parse.parse_qs(parsed.query)
-            params["oauth_token"] = (query.get("oauth_token") or [None])[0]
-            params["oauth_verifier"] = (query.get("oauth_verifier") or [None])[0]
-            event.set()
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"OAuth complete. You may close this tab.")
-
-        def log_message(self, format: str, *args: object) -> None:  # noqa: A003
-            OAUTH_LOGGER.debug("OAuth1 callback: " + format, *args)
-
-    class _Server(socketserver.TCPServer):
-        allow_reuse_address = True
-
-    server = _Server((host, port), _Handler)
-    server.timeout = 1
-
-    deadline = time.time() + timeout_seconds
-    try:
-        while time.time() < deadline:
-            server.handle_request()
-            if event.is_set():
-                break
-    finally:
-        server.server_close()
-
-    oauth_token = params.get("oauth_token")
-    oauth_verifier = params.get("oauth_verifier")
-    if not oauth_token or not oauth_verifier:
-        raise TimeoutError("OAuth callback not received before timeout.")
-    return oauth_token, oauth_verifier
-
-
-def run_oauth1_flow() -> tuple[str, str]:
-    consumer_key = os.getenv("X_OAUTH_CONSUMER_KEY")
-    consumer_secret = os.getenv("X_OAUTH_CONSUMER_SECRET")
-    if not consumer_key or not consumer_secret:
-        raise RuntimeError(
-            "Missing X_OAUTH_CONSUMER_KEY or X_OAUTH_CONSUMER_SECRET for OAuth1 flow."
-        )
-
-    callback_host = os.getenv("X_OAUTH_CALLBACK_HOST", "127.0.0.1")
-    callback_port = _get_env_int("X_OAUTH_CALLBACK_PORT", 8976)
-    callback_path = os.getenv("X_OAUTH_CALLBACK_PATH", "/oauth/callback")
-    callback_timeout = _get_env_int("X_OAUTH_CALLBACK_TIMEOUT", 300)
-
-    callback_url = _callback_url(callback_host, callback_port, callback_path)
-
-    oauth = OAuth1Session(
-        client_key=consumer_key,
-        client_secret=consumer_secret,
-        callback_uri=callback_url,
-    )
-    request_token = oauth.fetch_request_token(REQUEST_TOKEN_URL)
-    resource_owner_key = request_token.get("oauth_token")
-    resource_owner_secret = request_token.get("oauth_token_secret")
-    if not resource_owner_key or not resource_owner_secret:
-        raise RuntimeError("Failed to obtain OAuth request token.")
-
-    authorization_url = oauth.authorization_url(AUTHORIZE_URL)
-    OAUTH_LOGGER.info("Opening browser for OAuth1 consent.")
-    webbrowser.open(authorization_url)
-
-    oauth_token, oauth_verifier = _wait_for_callback(
-        callback_host, callback_port, callback_path, callback_timeout
-    )
-    if oauth_token != resource_owner_key:
-        raise RuntimeError("OAuth callback token does not match request token.")
-
-    oauth = OAuth1Session(
-        client_key=consumer_key,
-        client_secret=consumer_secret,
-        resource_owner_key=resource_owner_key,
-        resource_owner_secret=resource_owner_secret,
-        verifier=oauth_verifier,
-    )
-    access_token = oauth.fetch_access_token(ACCESS_TOKEN_URL)
-    access_key = access_token.get("oauth_token")
-    access_secret = access_token.get("oauth_token_secret")
-    if not access_key or not access_secret:
-        raise RuntimeError("Failed to obtain OAuth access token.")
-    return access_key, access_secret
 
 
 def load_env() -> None:
@@ -296,50 +176,102 @@ def print_tool_list(spec: dict) -> None:
         print(f"- {tool}")
 
 
-def get_auth_headers(oauth_token: str | None = None) -> dict:
-    env_oauth_token = os.getenv("X_OAUTH_ACCESS_TOKEN", "").strip()
-    bearer_token = os.getenv("X_BEARER_TOKEN", "").strip()
-    token = oauth_token or env_oauth_token or bearer_token
-    if not token:
-        raise RuntimeError(
-            "Set X_BEARER_TOKEN or provide OAuth1 access token on startup."
+class OAuth2TokenManager:
+    """Manages OAuth2 access tokens with automatic refresh."""
+
+    def __init__(
+        self,
+        client_id: str,
+        client_secret: str,
+        refresh_token: str,
+        token_file: str | None = None,
+    ):
+        self._client_id = client_id
+        self._client_secret = client_secret
+        self._access_token = ""
+        self._refresh_token = refresh_token
+        self._expires_at = 0.0
+        self._token_file = token_file
+        self._lock = asyncio.Lock()
+
+    async def get_access_token(self) -> str:
+        if self._access_token and time.time() < self._expires_at - 60:
+            return self._access_token
+        async with self._lock:
+            if self._access_token and time.time() < self._expires_at - 60:
+                return self._access_token
+            await self._refresh()
+            return self._access_token
+
+    async def _refresh(self) -> None:
+        AUTH_LOGGER.info("Refreshing OAuth2 access token...")
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                OAUTH2_TOKEN_URL,
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": self._refresh_token,
+                    "client_id": self._client_id,
+                },
+                auth=(self._client_id, self._client_secret),
+            )
+            if response.status_code != 200:
+                body = response.text
+                raise RuntimeError(
+                    f"OAuth2 token refresh failed ({response.status_code}): {body}"
+                )
+            data = response.json()
+
+        self._access_token = data["access_token"]
+        self._refresh_token = data["refresh_token"]
+        self._expires_at = time.time() + data.get("expires_in", 7200)
+        AUTH_LOGGER.info(
+            "OAuth2 token refreshed, expires in %ds", data.get("expires_in", 7200)
         )
-    return {"Authorization": f"Bearer {token}"}
+
+        if self._token_file:
+            token_path = Path(self._token_file)
+            token_path.write_text(
+                json.dumps({"refresh_token": self._refresh_token}), encoding="utf-8"
+            )
+            AUTH_LOGGER.info("Saved new refresh token to %s", self._token_file)
 
 
-def build_oauth1_client() -> OAuth1Client:
-    consumer_key = os.getenv("X_OAUTH_CONSUMER_KEY")
-    consumer_secret = os.getenv("X_OAUTH_CONSUMER_SECRET")
-    if not consumer_key or not consumer_secret:
+def build_token_manager() -> OAuth2TokenManager:
+    client_id = os.getenv("X_CLIENT_ID", "").strip()
+    client_secret = os.getenv("X_CLIENT_SECRET", "").strip()
+    if not client_id or not client_secret:
+        raise RuntimeError("Missing X_CLIENT_ID or X_CLIENT_SECRET.")
+
+    token_file = os.getenv("X_TOKEN_FILE", "").strip() or None
+
+    refresh_token = ""
+    if token_file:
+        token_path = Path(token_file)
+        if token_path.exists():
+            try:
+                data = json.loads(token_path.read_text(encoding="utf-8"))
+                refresh_token = data.get("refresh_token", "")
+                if refresh_token:
+                    AUTH_LOGGER.info("Loaded refresh token from %s", token_file)
+            except (json.JSONDecodeError, OSError) as e:
+                AUTH_LOGGER.warning("Failed to read token file %s: %s", token_file, e)
+
+    if not refresh_token:
+        refresh_token = os.getenv("X_REFRESH_TOKEN", "").strip()
+
+    if not refresh_token:
         raise RuntimeError(
-            "Missing X_OAUTH_CONSUMER_KEY or X_OAUTH_CONSUMER_SECRET for OAuth1 signing."
+            "No refresh token found. Set X_REFRESH_TOKEN in .env or provide X_TOKEN_FILE.\n"
+            "To obtain a refresh token, run: python generate_token.py"
         )
-    access_token, access_secret = run_oauth1_flow()
-    if is_truthy(os.getenv("X_OAUTH_PRINT_TOKENS", "0")):
-        print("OAuth1 access token:", access_token)
-        print("OAuth1 access token secret:", access_secret)
-    LOGGER.info("OAuth1 access token: %s", access_token)
-    return OAuth1Client(
-        client_key=consumer_key,
-        client_secret=consumer_secret,
-        resource_owner_key=access_token,
-        resource_owner_secret=access_secret,
-        signature_type="AUTH_HEADER",
-    )
 
-
-def print_oauth1_header_probe(oauth1_client: OAuth1Client, base_url: str) -> None:
-    probe_url = f"{base_url}/2/users/me"
-    _, signed_headers, _ = oauth1_client.sign(
-        probe_url,
-        http_method="GET",
-        headers={},
+    return OAuth2TokenManager(
+        client_id=client_id,
+        client_secret=client_secret,
+        refresh_token=refresh_token,
+        token_file=token_file,
     )
-    auth_header = signed_headers.get("Authorization")
-    if auth_header:
-        print("OAuth1 Authorization header (sample GET /2/users/me):", auth_header)
-    else:
-        print("OAuth1 Authorization header missing from signed probe request.")
 
 
 def create_mcp() -> FastMCP:
@@ -352,15 +284,13 @@ def create_mcp() -> FastMCP:
     base_url = os.getenv("X_API_BASE_URL", "https://api.x.com")
     timeout = float(os.getenv("X_API_TIMEOUT", "30"))
 
-    oauth1_client = build_oauth1_client()
-    print_oauth_header = is_truthy(os.getenv("X_OAUTH_PRINT_AUTH_HEADER", "0"))
-    if print_oauth_header:
-        print_oauth1_header_probe(oauth1_client, base_url)
+    token_manager = build_token_manager()
 
     spec = load_openapi_spec()
     filtered_spec = filter_openapi_spec(spec)
     comma_params = collect_comma_params(filtered_spec)
     print_tool_list(filtered_spec)
+
     async def normalize_query_params(request: httpx.Request) -> None:
         if not comma_params:
             return
@@ -394,28 +324,10 @@ def create_mcp() -> FastMCP:
 
     b3_flags = os.getenv("X_B3_FLAGS", "1")
 
-    async def sign_oauth1_request(request: httpx.Request) -> None:
+    async def add_bearer_token(request: httpx.Request) -> None:
         request.headers["X-B3-Flags"] = b3_flags
-        headers = dict(request.headers)
-        content_type = headers.get("Content-Type", "")
-        body: str | None = None
-        if content_type.startswith("application/x-www-form-urlencoded"):
-            body_bytes = request.content or b""
-            body = body_bytes.decode("utf-8")
-        signed_url, signed_headers, _ = oauth1_client.sign(
-            str(request.url),
-            http_method=request.method,
-            body=body,
-            headers=headers,
-        )
-        request.url = httpx.URL(signed_url)
-        request.headers.update(signed_headers)
-        if print_oauth_header:
-            auth_header = signed_headers.get("Authorization")
-            if auth_header:
-                print("OAuth1 Authorization header:", auth_header)
-            else:
-                print("OAuth1 Authorization header missing from signed request.")
+        access_token = await token_manager.get_access_token()
+        request.headers["Authorization"] = f"Bearer {access_token}"
 
     async def log_request(request: httpx.Request) -> None:
         if not debug_enabled:
@@ -446,7 +358,7 @@ def create_mcp() -> FastMCP:
         headers={},
         timeout=timeout,
         event_hooks={
-            "request": [normalize_query_params, sign_oauth1_request, log_request],
+            "request": [normalize_query_params, add_bearer_token, log_request],
             "response": [log_response],
         },
     )
@@ -460,8 +372,13 @@ def create_mcp() -> FastMCP:
 def main() -> None:
     host = os.getenv("MCP_HOST", "127.0.0.1")
     port = int(os.getenv("MCP_PORT", "8000"))
+    transport = os.getenv("MCP_TRANSPORT", "http")
+    if transport not in ("http", "sse", "stdio"):
+        raise RuntimeError(
+            f"Unsupported MCP_TRANSPORT={transport!r}. Use 'http', 'sse', or 'stdio'."
+        )
     mcp = create_mcp()
-    mcp.run(transport="http", host=host, port=port)
+    mcp.run(transport=transport, host=host, port=port)
 
 
 if __name__ == "__main__":
