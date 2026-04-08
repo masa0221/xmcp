@@ -1,7 +1,7 @@
 """Obtain an OAuth2 refresh token for the X API via Authorization Code + PKCE.
 
 Usage:
-    1. Set X_CLIENT_ID and X_CLIENT_SECRET in .env
+    1. Set CLIENT_ID and CLIENT_SECRET in .env
     2. Run: python generate_token.py
     3. A browser opens for authorization
     4. After consent, the refresh token is printed and optionally saved
@@ -95,10 +95,10 @@ def wait_for_code(host: str, port: int, path: str, timeout: int) -> str:
 
 
 def main() -> None:
-    client_id = os.getenv("X_CLIENT_ID", "").strip()
-    client_secret = os.getenv("X_CLIENT_SECRET", "").strip()
+    client_id = os.getenv("CLIENT_ID", "").strip()
+    client_secret = os.getenv("CLIENT_SECRET", "").strip()
     if not client_id or not client_secret:
-        print("Error: Set X_CLIENT_ID and X_CLIENT_SECRET in .env")
+        print("Error: Set CLIENT_ID and CLIENT_SECRET in .env")
         return
 
     callback_host = os.getenv("X_OAUTH_CALLBACK_HOST", "127.0.0.1")

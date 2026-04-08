@@ -470,10 +470,10 @@ class OAuth2TokenManager:
 
 def build_oauth2_auth_hook() -> Callable[[httpx.Request], Awaitable[None]]:
     """Build OAuth2 Bearer token hook with auto-refresh."""
-    client_id = os.getenv("X_CLIENT_ID", "").strip()
-    client_secret = os.getenv("X_CLIENT_SECRET", "").strip()
+    client_id = os.getenv("CLIENT_ID", "").strip()
+    client_secret = os.getenv("CLIENT_SECRET", "").strip()
     if not client_id or not client_secret:
-        raise RuntimeError("Missing X_CLIENT_ID or X_CLIENT_SECRET for OAuth2.")
+        raise RuntimeError("Missing CLIENT_ID or CLIENT_SECRET for OAuth2.")
 
     token_file = os.getenv("X_TOKEN_FILE", "").strip() or None
 
