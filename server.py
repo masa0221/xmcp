@@ -31,10 +31,12 @@ HTTP_METHODS = {
 
 LOGGER = logging.getLogger("xmcp.x_api")
 OAUTH_LOGGER = logging.getLogger("xmcp.oauth1")
+OAUTH2_LOGGER = logging.getLogger("xmcp.oauth2")
 
 REQUEST_TOKEN_URL = "https://api.x.com/oauth/request_token"
 AUTHORIZE_URL = "https://api.x.com/oauth/authorize"
 ACCESS_TOKEN_URL = "https://api.x.com/oauth/access_token"
+OAUTH2_TOKEN_URL = "https://api.x.com/2/oauth2/token"
 
 
 def is_truthy(value: str | None) -> bool:
@@ -405,6 +407,136 @@ def build_oauth1_auth_hook(
     return sign_oauth1_request
 
 
+class OAuth2TokenManager:
+    """Manages OAuth2 access tokens with automatic refresh."""
+
+    def __init__(
+        self,
+        client_id: str,
+        client_secret: str,
+        refresh_token: str,
+        token_file: str | None = None,
+    ):
+        self._client_id = client_id
+        self._client_secret = client_secret
+        self._access_token = ""
+        self._refresh_token = refresh_token
+        self._expires_at = 0.0
+        self._token_file = token_file
+        self._lock = asyncio.Lock()
+
+    async def get_access_token(self) -> str:
+        if self._access_token and time.time() < self._expires_at - 60:
+            return self._access_token
+        async with self._lock:
+            if self._access_token and time.time() < self._expires_at - 60:
+                return self._access_token
+            await self._refresh()
+            return self._access_token
+
+    async def _refresh(self) -> None:
+        OAUTH2_LOGGER.info("Refreshing OAuth2 access token...")
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                OAUTH2_TOKEN_URL,
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": self._refresh_token,
+                    "client_id": self._client_id,
+                },
+                auth=(self._client_id, self._client_secret),
+            )
+            if response.status_code != 200:
+                body = response.text
+                raise RuntimeError(
+                    f"OAuth2 token refresh failed ({response.status_code}): {body}"
+                )
+            data = response.json()
+
+        self._access_token = data["access_token"]
+        self._refresh_token = data["refresh_token"]
+        self._expires_at = time.time() + data.get("expires_in", 7200)
+        OAUTH2_LOGGER.info(
+            "OAuth2 token refreshed, expires in %ds", data.get("expires_in", 7200)
+        )
+
+        if self._token_file:
+            token_path = Path(self._token_file)
+            token_path.write_text(
+                json.dumps({"refresh_token": self._refresh_token}), encoding="utf-8"
+            )
+            OAUTH2_LOGGER.info("Saved new refresh token to %s", self._token_file)
+
+
+def build_oauth2_auth_hook() -> Callable[[httpx.Request], Awaitable[None]]:
+    """Build OAuth2 Bearer token hook with auto-refresh."""
+    client_id = os.getenv("X_CLIENT_ID", "").strip()
+    client_secret = os.getenv("X_CLIENT_SECRET", "").strip()
+    if not client_id or not client_secret:
+        raise RuntimeError("Missing X_CLIENT_ID or X_CLIENT_SECRET for OAuth2.")
+
+    token_file = os.getenv("X_TOKEN_FILE", "").strip() or None
+
+    refresh_token = ""
+    if token_file:
+        token_path = Path(token_file)
+        if token_path.exists():
+            try:
+                data = json.loads(token_path.read_text(encoding="utf-8"))
+                refresh_token = data.get("refresh_token", "")
+                if refresh_token:
+                    OAUTH2_LOGGER.info("Loaded refresh token from %s", token_file)
+            except (json.JSONDecodeError, OSError) as e:
+                OAUTH2_LOGGER.warning(
+                    "Failed to read token file %s: %s", token_file, e
+                )
+
+    if not refresh_token:
+        refresh_token = os.getenv("X_REFRESH_TOKEN", "").strip()
+
+    if not refresh_token:
+        raise RuntimeError(
+            "No refresh token found. Set X_REFRESH_TOKEN in .env or provide X_TOKEN_FILE.\n"
+            "To obtain a refresh token, run: python generate_token.py"
+        )
+
+    token_manager = OAuth2TokenManager(
+        client_id=client_id,
+        client_secret=client_secret,
+        refresh_token=refresh_token,
+        token_file=token_file,
+    )
+
+    b3_flags = os.getenv("X_B3_FLAGS", "1")
+
+    async def add_bearer_token(request: httpx.Request) -> None:
+        request.headers["X-B3-Flags"] = b3_flags
+        access_token = await token_manager.get_access_token()
+        request.headers["Authorization"] = f"Bearer {access_token}"
+
+    LOGGER.info("Auth mode: OAuth2")
+    return add_bearer_token
+
+
+def build_auth_hook(
+    base_url: str,
+) -> Callable[[httpx.Request], Awaitable[None]]:
+    """Auto-detect auth method from environment variables.
+
+    Priority:
+      1. OAuth2 — X_REFRESH_TOKEN or X_TOKEN_FILE is set
+      2. OAuth1 (env) — X_OAUTH1_ACCESS_TOKEN + X_OAUTH1_ACCESS_TOKEN_SECRET
+      3. OAuth1 (browser) — X_OAUTH_CONSUMER_KEY + X_OAUTH_CONSUMER_SECRET
+    """
+    has_oauth2 = bool(
+        os.getenv("X_REFRESH_TOKEN", "").strip()
+        or os.getenv("X_TOKEN_FILE", "").strip()
+    )
+    if has_oauth2:
+        return build_oauth2_auth_hook()
+    return build_oauth1_auth_hook(base_url)
+
+
 def create_mcp() -> FastMCP:
     load_env()
     debug_enabled = setup_logging()
@@ -415,7 +547,7 @@ def create_mcp() -> FastMCP:
     base_url = os.getenv("X_API_BASE_URL", "https://api.x.com")
     timeout = float(os.getenv("X_API_TIMEOUT", "30"))
 
-    auth_hook = build_oauth1_auth_hook(base_url)
+    auth_hook = build_auth_hook(base_url)
 
     spec = load_openapi_spec()
     filtered_spec = filter_openapi_spec(spec)
