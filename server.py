@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import http.server
 import json
@@ -9,6 +10,7 @@ import time
 import urllib.parse
 import webbrowser
 from pathlib import Path
+from typing import Awaitable, Callable
 
 import httpx
 import requests
@@ -314,10 +316,33 @@ def build_oauth1_client() -> OAuth1Client:
         raise RuntimeError(
             "Missing X_OAUTH_CONSUMER_KEY or X_OAUTH_CONSUMER_SECRET for OAuth1 signing."
         )
-    access_token, access_secret = run_oauth1_flow()
-    if is_truthy(os.getenv("X_OAUTH_PRINT_TOKENS", "0")):
-        print("OAuth1 access token:", access_token)
-        print("OAuth1 access token secret:", access_secret)
+    access_token = os.getenv("X_OAUTH1_ACCESS_TOKEN", "").strip()
+    access_secret = os.getenv("X_OAUTH1_ACCESS_TOKEN_SECRET", "").strip()
+
+    if access_token and access_secret:
+        OAUTH_LOGGER.info(
+            "Using existing OAuth1 tokens from environment, skipping browser flow."
+        )
+    elif access_token or access_secret:
+        missing = (
+            "X_OAUTH1_ACCESS_TOKEN_SECRET"
+            if access_token
+            else "X_OAUTH1_ACCESS_TOKEN"
+        )
+        OAUTH_LOGGER.warning(
+            "%s is set but %s is missing; falling back to browser OAuth1 flow.",
+            "X_OAUTH1_ACCESS_TOKEN" if access_token else "X_OAUTH1_ACCESS_TOKEN_SECRET",
+            missing,
+        )
+        access_token, access_secret = run_oauth1_flow()
+        if is_truthy(os.getenv("X_OAUTH_PRINT_TOKENS", "0")):
+            print("OAuth1 access token:", access_token)
+            print("OAuth1 access token secret:", access_secret)
+    else:
+        access_token, access_secret = run_oauth1_flow()
+        if is_truthy(os.getenv("X_OAUTH_PRINT_TOKENS", "0")):
+            print("OAuth1 access token:", access_token)
+            print("OAuth1 access token secret:", access_secret)
     LOGGER.info("OAuth1 access token: %s", access_token)
     return OAuth1Client(
         client_key=consumer_key,
@@ -342,6 +367,44 @@ def print_oauth1_header_probe(oauth1_client: OAuth1Client, base_url: str) -> Non
         print("OAuth1 Authorization header missing from signed probe request.")
 
 
+def build_oauth1_auth_hook(
+    base_url: str,
+) -> Callable[[httpx.Request], Awaitable[None]]:
+    """Build OAuth1 signing hook. Returns the async request hook."""
+    oauth1_client = build_oauth1_client()
+    print_oauth_header = is_truthy(os.getenv("X_OAUTH_PRINT_AUTH_HEADER", "0"))
+    if print_oauth_header:
+        print_oauth1_header_probe(oauth1_client, base_url)
+
+    b3_flags = os.getenv("X_B3_FLAGS", "1")
+
+    async def sign_oauth1_request(request: httpx.Request) -> None:
+        request.headers["X-B3-Flags"] = b3_flags
+        headers = dict(request.headers)
+        content_type = headers.get("Content-Type", "")
+        body: str | None = None
+        if content_type.startswith("application/x-www-form-urlencoded"):
+            body_bytes = request.content or b""
+            body = body_bytes.decode("utf-8")
+        signed_url, signed_headers, _ = oauth1_client.sign(
+            str(request.url),
+            http_method=request.method,
+            body=body,
+            headers=headers,
+        )
+        request.url = httpx.URL(signed_url)
+        request.headers.update(signed_headers)
+        if print_oauth_header:
+            auth_header = signed_headers.get("Authorization")
+            if auth_header:
+                print("OAuth1 Authorization header:", auth_header)
+            else:
+                print("OAuth1 Authorization header missing from signed request.")
+
+    LOGGER.info("Auth mode: OAuth1")
+    return sign_oauth1_request
+
+
 def create_mcp() -> FastMCP:
     load_env()
     debug_enabled = setup_logging()
@@ -352,15 +415,13 @@ def create_mcp() -> FastMCP:
     base_url = os.getenv("X_API_BASE_URL", "https://api.x.com")
     timeout = float(os.getenv("X_API_TIMEOUT", "30"))
 
-    oauth1_client = build_oauth1_client()
-    print_oauth_header = is_truthy(os.getenv("X_OAUTH_PRINT_AUTH_HEADER", "0"))
-    if print_oauth_header:
-        print_oauth1_header_probe(oauth1_client, base_url)
+    auth_hook = build_oauth1_auth_hook(base_url)
 
     spec = load_openapi_spec()
     filtered_spec = filter_openapi_spec(spec)
     comma_params = collect_comma_params(filtered_spec)
     print_tool_list(filtered_spec)
+
     async def normalize_query_params(request: httpx.Request) -> None:
         if not comma_params:
             return
@@ -392,31 +453,6 @@ def create_mcp() -> FastMCP:
 
         request.url = request.url.copy_with(params=normalized)
 
-    b3_flags = os.getenv("X_B3_FLAGS", "1")
-
-    async def sign_oauth1_request(request: httpx.Request) -> None:
-        request.headers["X-B3-Flags"] = b3_flags
-        headers = dict(request.headers)
-        content_type = headers.get("Content-Type", "")
-        body: str | None = None
-        if content_type.startswith("application/x-www-form-urlencoded"):
-            body_bytes = request.content or b""
-            body = body_bytes.decode("utf-8")
-        signed_url, signed_headers, _ = oauth1_client.sign(
-            str(request.url),
-            http_method=request.method,
-            body=body,
-            headers=headers,
-        )
-        request.url = httpx.URL(signed_url)
-        request.headers.update(signed_headers)
-        if print_oauth_header:
-            auth_header = signed_headers.get("Authorization")
-            if auth_header:
-                print("OAuth1 Authorization header:", auth_header)
-            else:
-                print("OAuth1 Authorization header missing from signed request.")
-
     async def log_request(request: httpx.Request) -> None:
         if not debug_enabled:
             return
@@ -446,7 +482,7 @@ def create_mcp() -> FastMCP:
         headers={},
         timeout=timeout,
         event_hooks={
-            "request": [normalize_query_params, sign_oauth1_request, log_request],
+            "request": [normalize_query_params, auth_hook, log_request],
             "response": [log_response],
         },
     )
@@ -460,8 +496,13 @@ def create_mcp() -> FastMCP:
 def main() -> None:
     host = os.getenv("MCP_HOST", "127.0.0.1")
     port = int(os.getenv("MCP_PORT", "8000"))
+    transport = os.getenv("MCP_TRANSPORT", "http")
+    if transport not in ("http", "sse", "stdio"):
+        raise RuntimeError(
+            f"Unsupported MCP_TRANSPORT={transport!r}. Use 'http', 'sse', or 'stdio'."
+        )
     mcp = create_mcp()
-    mcp.run(transport="http", host=host, port=port)
+    mcp.run(transport=transport, host=host, port=port)
 
 
 if __name__ == "__main__":

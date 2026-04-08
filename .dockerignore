@@ -1,0 +1,13 @@
+.git
+.gitignore
+.venv
+venv
+env
+.env
+.env.*
+__pycache__
+*.py[cod]
+.DS_Store
+scripts/
+README.md
+test_grok_mcp.py
